@@ -1,0 +1,134 @@
+<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width"><title>Aggroso - Billing Dispute Agent</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script><script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script><script src="https://unpkg.com/@babel/standalone/babel.min.js"></script><script src="https://cdn.tailwindcss.com"></script>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;800&family=Syne:wght@600;700&display=swap" rel="stylesheet">
+<style>
+*{font-family:'Outfit',sans-serif}.syne{font-family:'Syne',sans-serif}
+.bg-aura{position:fixed; inset:0; z-index:-2; background: url('bg.png'); background-size:cover; background-position:left center;}
+.overlay{position:fixed; inset:0; z-index:-1; background: linear-gradient(90deg, rgba(0,0,0,0.2) 0%, rgba(10,15,10,0.7) 55%, #0A0F0A 100%);}
+.glass{background: rgba(20,30,20,0.85); backdrop-filter: blur(20px); border:1px solid rgba(255,255,255,0.08)}
+.input-dark{background: rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.12); color:white;}
+.btn-lime{background:#D6FF4D; color:#0A0F0A; font-weight:700}.btn-lime:hover{background:#E0FF70}
+.policy-tag{border-left:3px solid #D6FF4D; background: rgba(214,255,77,0.08)}
+</style>
+</head><body><div id="root"></div>
+<script type="text/babel">
+const {useState, useMemo}=React;
+
+// Mock Policy KB for RAG
+const POLICY_KB = {
+  OVERCHARGE: { section: "Sec 4.2 - Pricing Accuracy", text: "If billed amount exceeds contracted rate by >5%, eligible for refund. Evidence: Contract Rate Card.", limit: 0.05 },
+  DUPLICATE: { section: "Sec 3.1 - Duplicate Billing", text: "Duplicate invoice IDs or same service date + amount flagged as duplicate. Must provide both invoice IDs.", limit: 0 },
+  SERVICE_NOT_RENDERED: { section: "Sec 5.4 - Service Delivery", text: "If service log shows no delivery, full refund. Requires service log evidence.", limit: 1.0 },
+  FEE_DISPUTE: { section: "Sec 6.1 - Fee Waivers", text: "Late fees / processing fees waivable if customer tenure >12 months or first occurrence.", limit: 100 },
+  CONTRACT_MISMATCH: { section: "Sec 2.3 - Contract Terms", text: "Charges must match SOW. Any deviation needs manager override.", limit: 0 }
+};
+
+function App(){
+  const [role,setRole]=useState(localStorage.getItem('bd_role')||''); const [logged,setLogged]=useState(!!role); const [view,setView]=useState(role||'investigator');
+  const [invoice,setInvoice]=useState({invoiceId:'INV-2026-1042', customer:'Acme Corp', date:new Date().toISOString().split('T')[0], category:'OVERCHARGE', amount:1250, contractAmount:1000, currency:'USD', description:'Monthly SaaS license billed 1250 but contract says 1000', contractAvailable:true, receipt:true});
+  const [history,setHistory]=useState([{invoiceId:'INV-2026-1042', customer:'Acme Corp', date:'2026-10-08', category:'OVERCHARGE', amount:1250, contractAmount:1000, status:'NEEDS_REVIEW', aiCategory:'OVERCHARGE', confidence:0.92, missingInfo:[], duplicate:false, policy: POLICY_KB.OVERCHARGE, explanation:'Billed exceeds contract by 25%', decisionHistory:[] }]);
+  const [selected,setSelected]=useState(history[0]); const [override,setOverride]=useState(''); const [overrideReason,setOverrideReason]=useState(''); const [clarifyMsg,setClarifyMsg]=useState('');
+
+  // AI WORKFLOW + DETERMINISTIC
+  const analysis = useMemo(()=>{
+    const amount = +invoice.amount; const cAmount = +invoice.contractAmount;
+    const diff = (amount - cAmount)/cAmount;
+    // 1. Classify ambiguous description
+    let aiCat = invoice.category; let conf = 0.95;
+    const desc = invoice.description.toLowerCase();
+    if(desc.includes('twice')||desc.includes('duplicate')) {aiCat='DUPLICATE'; conf=0.88;}
+    else if(desc.includes('not delivered')||desc.includes('no service')) {aiCat='SERVICE_NOT_RENDERED'; conf=0.91;}
+    else if(desc.includes('fee')||desc.includes('late')) {aiCat='FEE_DISPUTE'; conf=0.85;}
+    else if(diff>0.05) {aiCat='OVERCHARGE'; conf=0.92;}
+
+    // 2. Retrieve policy
+    const policy = POLICY_KB[aiCat];
+    // 3. Deterministic validation
+    const isDuplicate = history.some(h=>h.invoiceId===invoice.invoiceId && h.invoiceId!==selected?.invoiceId);
+    const missing = [];
+    if(!invoice.contractAvailable) missing.push('Contract copy');
+    if(!invoice.receipt) missing.push('Invoice receipt');
+    if(!invoice.description) missing.push('Description');
+    const dateValid = new Date(invoice.date) <= new Date();
+    const uncertain = conf < 0.9;
+
+    // 4. Explain compliance
+    let status='NEEDS_REVIEW'; let explain='';
+    if(aiCat==='OVERCHARGE' && diff>policy.limit) {status='COMPLIANT_FOR_REFUND'; explain=`Billed $${amount} vs contract $${cAmount} (${(diff*100).toFixed(1)}% over). Policy ${policy.section} allows refund if >5%.`;}
+    else if(aiCat==='DUPLICATE' && isDuplicate) {status='DUPLICATE_FOUND'; explain=`Duplicate detected. ${policy.text}`;}
+    else if(missing.length>0) {status='NEEDS_CLARIFICATION'; explain=`Missing: ${missing.join(', ')}. ${policy.text}`;}
+    else {status='NEEDS_REVIEW'; explain=`Category ${aiCat} flagged. ${policy.text}`;}
+
+    return {aiCat, conf, policy, isDuplicate, missing, dateValid, status, explain, uncertain};
+  },[invoice, history, selected]);
+
+  const submitCase = ()=>{
+    const rec = {invoiceId:invoice.invoiceId, customer:invoice.customer, date:invoice.date, category:invoice.category, amount:+invoice.amount, contractAmount:+invoice.contractAmount, status:analysis.status, aiCategory:analysis.aiCat, confidence:analysis.conf, missingInfo:analysis.missing, duplicate:analysis.isDuplicate, policy:analysis.policy, explanation:analysis.explain, description:invoice.description, decisionHistory:[{action:'AI_ANALYSIS', by:'AI Agent', time:new Date().toLocaleString(), note:analysis.explain}]};
+    setHistory(p=>[rec,...p]); setSelected(rec);
+  };
+
+  const takeAction = (action, note)=>{
+    const updated = {...selected, status:action, decisionHistory:[...selected.decisionHistory, {action, by: role==='admin'?'Admin':role, time:new Date().toLocaleString(), note}]};
+    setHistory(p=>p.map(h=>h.invoiceId===selected.invoiceId?updated:h)); setSelected(updated);
+  };
+
+  if(!logged) return <div className="min-h-screen flex relative overflow-hidden"><div className="bg-aura"></div><div className="overlay"></div><div className="hidden md:block w-[55%] relative"><div className="absolute bottom-10 left-10 text-white"><h1 className="syne text-6xl font-bold leading-[0.9]">BILLING<br/>DISPUTE<br/>AGENT.</h1><p className="mt-4 text-white/60 text-sm max-w-[300px]">AI-powered investigation + deterministic validation for enterprise billing.</p></div></div><div className="w-full md:w-[45%] bg-[#0A0F0A] min-h-screen flex items-center justify-center p-8"><div className="w-full max-w-[400px]"><h1 className="syne text-2xl text-white font-bold">Aggroso Billing</h1><p className="text-[#D6FF4D] text-sm">Expert Edition • 7-10 hrs</p><h2 className="syne text-[32px] font-bold text-white mt-8 leading-tight">Dispute Investigation<br/>Resolution Agent</h2><div className="mt-8 space-y-4"><div className="flex gap-3"><button onClick={()=>{localStorage.setItem('bd_role','investigator'); setRole('investigator'); setView('investigator'); setLogged(true);}} className="flex-1 bg-white text-black py-3.5 rounded-full font-bold text-sm flex items-center justify-center gap-2"><span className="w-6 h-6 rounded-full bg-black text-white flex items-center justify-center">G</span> Investigator</button><button onClick={()=>{localStorage.setItem('bd_role','admin'); setRole('admin'); setView('admin'); setLogged(true);}} className="flex-1 bg-[#1A1A1A] text-white border border-white/10 py-3.5 rounded-full font-bold text-sm">Admin</button></div><button onClick={()=>{localStorage.setItem('bd_role','investigator'); setRole('investigator'); setView('investigator'); setLogged(true);}} className="btn-lime w-full py-4 rounded-full">Enter Agent Console ↗</button><p className="text-white/30 text-[11px] text-center">Demo: Investigator / Admin • Vault: aggroso2024</p></div></div></div></div>;
+
+  return <div className="min-h-screen relative"><div className="bg-aura"></div><div className="overlay"></div><div className="relative z-10 max-w-[1400px] mx-auto p-4 md:p-6">
+    <header className="glass p-4 rounded-2xl flex justify-between items-center text-white"><div className="flex items-center gap-3"><div className="w-9 h-9 rounded-xl bg-[#D6FF4D] text-black flex items-center justify-center font-black">A</div><div><h1 className="font-bold syne">Billing Dispute • {role.toUpperCase()}</h1><p className="text-[11px] text-white/50">AI: Classify → Retrieve Policy → Explain → Validate</p></div></div><div className="flex gap-2"><button onClick={()=>setView('investigator')} className={`px-5 py-2 rounded-full text-sm font-bold ${view==='investigator'?'bg-[#D6FF4D] text-black':'bg-white/10'}`}>Investigate</button><button onClick={()=>setView('admin')} className={`px-5 py-2 rounded-full text-sm font-bold ${view==='admin'?'bg-[#D6FF4D] text-black':'bg-white/10'}`}>Review Queue ({history.length})</button><button onClick={()=>{localStorage.clear(); setLogged(false);}} className="bg-red-500/80 px-4 py-2 rounded-full text-xs font-bold">Logout</button></div></header>
+
+    <div className="grid md:grid-cols-12 gap-6 mt-6">
+      {/* Left - Intake */}
+      <div className="md:col-span-4 glass p-6 rounded-2xl text-white h-fit">
+        <h3 className="syne font-bold text-lg">New Dispute Intake</h3><p className="text-[11px] text-white/40 mt-1">Deterministic + AI Workflow</p>
+        <div className="space-y-3 mt-5">
+          <div className="grid grid-cols-2 gap-3"><input value={invoice.invoiceId} onChange={e=>setInvoice({...invoice,invoiceId:e.target.value})} placeholder="Invoice ID" className="input-dark p-3 rounded-xl text-sm"/><input value={invoice.customer} onChange={e=>setInvoice({...invoice,customer:e.target.value})} placeholder="Customer" className="input-dark p-3 rounded-xl text-sm"/></div>
+          <div className="grid grid-cols-2 gap-3"><input type="date" value={invoice.date} onChange={e=>setInvoice({...invoice,date:e.target.value})} className="input-dark p-3 rounded-xl text-sm"/><select value={invoice.category} onChange={e=>setInvoice({...invoice,category:e.target.value})} className="input-dark p-3 rounded-xl text-sm"><option>OVERCHARGE</option><option>DUPLICATE</option><option>SERVICE_NOT_RENDERED</option><option>FEE_DISPUTE</option><option>CONTRACT_MISMATCH</option></select></div>
+          <div className="grid grid-cols-2 gap-3"><input type="number" value={invoice.amount} onChange={e=>setInvoice({...invoice,amount:e.target.value})} placeholder="Billed" className="input-dark p-3 rounded-xl text-sm font-bold"/><input type="number" value={invoice.contractAmount} onChange={e=>setInvoice({...invoice,contractAmount:e.target.value})} placeholder="Contract Amt" className="input-dark p-3 rounded-xl text-sm"/></div>
+          <textarea value={invoice.description} onChange={e=>setInvoice({...invoice,description:e.target.value})} rows="3" placeholder="Describe dispute..." className="input-dark w-full p-3 rounded-xl text-sm"></textarea>
+          <div className="flex gap-3 text-[12px]"><label className="flex items-center gap-2"><input type="checkbox" checked={invoice.contractAvailable} onChange={e=>setInvoice({...invoice,contractAvailable:e.target.checked})}/> Contract Available</label><label className="flex items-center gap-2"><input type="checkbox" checked={invoice.receipt} onChange={e=>setInvoice({...invoice,receipt:e.target.checked})}/> Receipt Yes</label></div>
+
+          {/* AI Live Preview */}
+          <div className="policy-tag p-3 rounded-xl mt-2"><div className="flex justify-between"><span className="text-[#D6FF4D] text-[11px] font-bold">AI CLASSIFY: {analysis.aiCat} {(analysis.conf*100).toFixed(0)}%</span>{analysis.uncertain && <span className="bg-amber-500 text-black px-2 py-0.5 rounded-full text-[9px] font-bold">UNCERTAIN</span>}</div><div className="text-[11px] text-white/70 mt-1">{analysis.policy.section}</div><div className="text-[12px] mt-1">{analysis.explain}</div></div>
+
+          <div className="grid grid-cols-2 gap-2 text-[11px]"><div className={`p-2 rounded-lg ${analysis.isDuplicate?'bg-red-500/20 border border-red-500/30':'bg-green-500/10'}`}>Duplicate: {analysis.isDuplicate?'FOUND':'No'}</div><div className={`p-2 rounded-lg ${analysis.missing.length?'bg-amber-500/20':'bg-green-500/10'}`}>Missing: {analysis.missing.length?analysis.missing.join(', '):'None'}</div></div>
+
+          <button onClick={submitCase} className="btn-lime w-full py-4 rounded-full">Run AI + Validate → Queue</button>
+        </div>
+      </div>
+
+      {/* Right - Results + History */}
+      <div className="md:col-span-8 space-y-4">
+        {selected && <div className="glass p-6 rounded-2xl text-white">
+          <div className="flex justify-between items-start"><div><h3 className="syne font-bold text-xl">{selected.invoiceId} • {selected.customer}</h3><p className="text-[12px] text-white/50">{selected.description}</p></div><span className={`px-3 py-1 rounded-full text-[11px] font-bold ${selected.status.includes('COMPLIANT')||selected.status.includes('REFUND')?'bg-[#D6FF4D] text-black': selected.status.includes('DUPLICATE')?'bg-red-500 text-white':'bg-amber-500 text-black'}`}>{selected.status}</span></div>
+
+          <div className="grid md:grid-cols-3 gap-3 mt-5">
+            <div className="bg-white/[0.05] p-4 rounded-xl"><div className="text-[10px] text-white/40">AI CLASSIFICATION</div><div className="font-bold text-sm mt-1">{selected.aiCategory} • {(selected.confidence*100).toFixed(0)}%</div><div className="text-[11px] text-white/50 mt-1">Confidence: {selected.confidence>0.9?'High':'Uncertain - needs review'}</div></div>
+            <div className="bg-white/[0.05] p-4 rounded-xl border-l-2 border-[#D6FF4D]"><div className="text-[10px] text-white/40">POLICY EVIDENCE</div><div className="font-bold text-[12px] mt-1 text-[#D6FF4D]">{selected.policy.section}</div><div className="text-[11px] mt-1">{selected.policy.text}</div></div>
+            <div className="bg-white/[0.05] p-4 rounded-xl"><div className="text-[10px] text-white/40">DETERMINISTIC</div><div className="text-[11px] mt-1">Billed: ${selected.amount} / Contract: ${selected.contractAmount}</div><div className="text-[11px] mt-1">Duplicate: {selected.duplicate?'Yes':'No'} • Missing: {selected.missingInfo?.length?selected.missingInfo.join(', '):'None'}</div></div>
+          </div>
+
+          <div className="mt-5">
+            <h4 className="text-[12px] font-bold text-white/70">EXPLANATION (Why?)</h4><p className="text-[13px] mt-1 bg-white/[0.03] p-3 rounded-xl">{selected.explanation}</p>
+          </div>
+
+          <div className="mt-5 flex flex-wrap gap-2">
+            <button onClick={()=>takeAction('APPROVED_REFUND', 'Approved for refund')} className="bg-[#D6FF4D] text-black px-5 py-2.5 rounded-full text-sm font-bold">Approve Refund</button>
+            <button onClick={()=>takeAction('REJECTED', 'Rejected - no evidence')} className="bg-red-600 text-white px-5 py-2.5 rounded-full text-sm font-bold">Reject</button>
+            <button onClick={()=>{const m=prompt('Clarification message?'); if(m) takeAction('CLARIFICATION_REQUESTED', m);}} className="bg-white/10 text-white px-5 py-2.5 rounded-full text-sm font-bold">Request Clarification</button>
+          </div>
+
+          <div className="mt-4 border-t border-white/10 pt-4">
+            <h4 className="text-[12px] font-bold">Override AI Classification</h4><div className="flex gap-2 mt-2"><select value={override} onChange={e=>setOverride(e.target.value)} className="input-dark p-2.5 rounded-full text-xs"><option value="">Select correct category</option><option>OVERCHARGE</option><option>DUPLICATE</option><option>SERVICE_NOT_RENDERED</option><option>FEE_DISPUTE</option><option>CONTRACT_MISMATCH</option></select><input value={overrideReason} onChange={e=>setOverrideReason(e.target.value)} placeholder="Reason for override" className="input-dark flex-1 p-2.5 rounded-full text-xs"/><button onClick={()=>{if(override && overrideReason){takeAction('OVERRIDDEN_'+override, 'Override: '+overrideReason); setOverride(''); setOverrideReason('');}}} className="bg-amber-500 text-black px-4 py-2 rounded-full text-xs font-bold">Override</button></div>
+          </div>
+
+          <div className="mt-5"><h4 className="text-[11px] font-bold text-white/50">DECISION HISTORY</h4><div className="mt-2 space-y-1 max-h-[150px] overflow-auto">{selected.decisionHistory?.map((d,i)=><div key={i} className="text-[11px] bg-white/[0.03] p-2 rounded-lg flex justify-between"><span><b>{d.action}</b> by {d.by}</span><span className="text-white/40">{d.time}</span></div>)}</div></div>
+        </div>}
+
+        <div className="glass p-6 rounded-2xl text-white"><h4 className="font-bold syne">Review Queue - All Cases</h4><div className="mt-4 space-y-2 max-h-[400px] overflow-auto">{history.map(h=><div key={h.invoiceId} onClick={()=>setSelected(h)} className={`p-4 rounded-xl cursor-pointer flex justify-between items-center ${selected?.invoiceId===h.invoiceId?'bg-[#D6FF4D]/20 border border-[#D6FF4D]/30':'bg-white/[0.05] border border-white/10'}`}><div><div className="font-bold text-sm">{h.invoiceId} • {h.customer} • ${h.amount}</div><div className="text-[11px] text-white/50">{h.aiCategory} ({(h.confidence*100).toFixed(0)}%) • {h.policy.section} • {h.status}</div></div><div className="text-[10px] bg-white/10 px-2 py-1 rounded-full">{h.date}</div></div>)}</div></div>
+      </div>
+    </div>
+  </div></div>;
+}
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script></body></html>
